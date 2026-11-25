@@ -1,0 +1,662 @@
+---
+title: "UPDATED 16S rRNA preprocessing (DADA2): Internal/External, Seasonal Mats, Diel"
+author: "Madelina"
+output: html_document
+---
+```{r}
+# 2. Set a new working directory (always use forward slashes, even on Windows)
+setwd("/Users/madelina/Desktop/spaciotemp.git")
+getwd()
+```
+
+This file holds the 16S preprocessing for all three experiments, from raw
+`_R1/_R2_16S_final.fastq` files to cleaned phyloseq objects:
+
+1. **Internal / External (Chapter 1)**: one MiSeq run, one error model.
+2. **Seasonal mats (SM)**: samples come from **two MiSeq runs** (10828 and
+   11002), so DADA2 learns a **separate error model for each run**. This section
+   replaces the earlier SM processing, which pooled both runs into one error
+   model. It also runs one sample at a time and saves every result, so it can
+   resume after a crash on a laptop.
+3. **Diel**: one run, one error model.
+
+All three use the same settings: primers 515F/806R (already removed),
+`truncLen = c(220, 220)`, `maxEE = c(2, 2)`, `minOverlap = 12`,
+`maxMismatch = 0`, merged length 245-265 bp, consensus chimera removal,
+SILVA v138.1, and prevalence-based decontam (threshold 0.5). Rarefaction is not used at this time..
+
+**Running this file.** Many steps take 20-60+ minutes and use a lot of memory,
+so chunks are set to `eval = FALSE` and the file knits as a code record. Run
+chunks interactively in order, or set `eval = TRUE` below.
+
+**Folder layout** (relative to this file; raw data and SILVA are not in the repo):
+
+```
+fastqfiles/        internal/external fastqs
+fastqfiles_sm/     seasonal mat fastqs
+fastqfiles_diel/   diel fastqs
+silva_nr99_v138.1_train_set.fa
+silva_species_assignment_v138.1.fa.gz
+Metadata_CH1_IE.csv, SM_SAMDF4.csv, DIEL_SAMDF.csv
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(eval = FALSE)   # set to TRUE to run everything on knit
+```
+
+# 0. Shared setup
+
+```{r install}
+# Only needed once
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("dada2", "ShortRead", "Biostrings", "phyloseq", "decontam"))
+```
+
+```{r libraries}
+library(dada2); packageVersion("dada2")
+library(ShortRead)
+library(Biostrings)
+library(phyloseq)
+library(decontam)
+library(ggplot2)
+```
+
+```{r paths}
+ie_path       <- "fastqfiles"        # internal/external
+sm_path       <- "fastqfiles_sm"     # seasonal mats
+diel_path     <- "fastqfiles_diel"   # diel
+silva         <- "silva_nr99_v138.1_train_set.fa"
+silva_species <- "silva_species_assignment_v138.1.fa.gz"
+stopifnot(file.exists(silva))
+```
+
+## Primers and helper functions (used by all three experiments)
+
+```{r primers}
+FWD <- "GTGYCAGCMGCCGCGGTAA"    # 515F
+REV <- "GGACTACNVGGGTWTCTAAT"   # 806R
+
+# All orientations of a primer
+allOrients <- function(primer) {
+  dna <- DNAString(primer)
+  orients <- c(Forward = dna, Complement = complement(dna),
+               Reverse = reverse(dna), RevComp = reverseComplement(dna))
+  sapply(orients, toString)
+}
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+
+# Number of reads in which a primer is found (want 0 everywhere)
+primerHits <- function(primer, fn) {
+  nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+  sum(nhits > 0)
+}
+primerTable <- function(fnF, fnR) {
+  rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnF),
+        FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnR),
+        REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnF),
+        REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnR))
+}
+
+# Quality profiles in groups of 10 samples
+plotQualityGroups <- function(files, size = 10) {
+  for (i in seq(1, length(files), by = size)) {
+    print(plotQualityProfile(files[i:min(i + size - 1, length(files))]))
+  }
+}
+
+getN <- function(x) sum(getUniques(x))
+```
+
+---
+
+# 1. Internal / External (Chapter 1)
+
+## 1.1 Files and sample names
+
+The sample name is the 3rd `_`-separated part of the file name (e.g.
+`MM_IE_D1_R1...` becomes `D1`). The negative control file `G8_R1_16S_final.fastq`
+becomes `"16S"`, and that name is used to find it in decontam below.
+
+```{r ie-files}
+fnFs.ie <- sort(list.files(ie_path, pattern = "_R1_16S_final.fastq", full.names = TRUE))
+fnRs.ie <- sort(list.files(ie_path, pattern = "_R2_16S_final.fastq", full.names = TRUE))
+sample.names.ie <- unname(sapply(fnFs.ie, function(f) strsplit(basename(f), "_")[[1]][3]))
+sample.names.ie
+```
+
+## 1.2 Remove reads with Ns (filtN) and check for primers
+
+```{r ie-filtN}
+fnFs.filtN.ie <- file.path(ie_path, "filtN", basename(fnFs.ie))
+fnRs.filtN.ie <- file.path(ie_path, "filtN", basename(fnRs.ie))
+filterAndTrim(fnFs.ie, fnFs.filtN.ie, fnRs.ie, fnRs.filtN.ie,
+              maxN = 0, multithread = TRUE, compress = TRUE)
+
+primerTable(fnFs.filtN.ie[[4]], fnRs.filtN.ie[[4]])   # all 0: no primers
+```
+
+## 1.3 Quality profiles
+
+```{r ie-qc}
+plotQualityGroups(fnFs.filtN.ie)
+plotQualityGroups(fnRs.filtN.ie)
+# Quality holds up well to 220 bp -> truncLen = c(220, 220)
+```
+
+## 1.4 Filter and trim
+
+```{r ie-trim}
+filtFs.ie <- file.path(ie_path, "trimmed", paste0(sample.names.ie, "_F_filt.fastq.gz"))
+filtRs.ie <- file.path(ie_path, "trimmed", paste0(sample.names.ie, "_R_filt.fastq.gz"))
+
+out.ie <- filterAndTrim(fnFs.ie, filtFs.ie, fnRs.ie, filtRs.ie,
+                        truncLen = c(220, 220), maxN = 0, maxEE = c(2, 2),
+                        truncQ = 2, rm.phix = TRUE, matchIDs = TRUE,
+                        compress = TRUE, multithread = TRUE)
+head(out.ie)
+write.csv(out.ie, "out.csv", row.names = TRUE, quote = FALSE)
+```
+
+## 1.5 Error rates
+
+```{r ie-errors}
+setDadaOpt(MAX_CONSIST = 30)   # more iterations to let the error model converge
+errF.ie <- learnErrors(filtFs.ie, multithread = TRUE)
+errR.ie <- learnErrors(filtRs.ie, multithread = TRUE)
+plotErrors(errF.ie, nominalQ = TRUE)
+plotErrors(errR.ie, nominalQ = TRUE)
+setDadaOpt(MAX_CONSIST = 10)   # back to the default for the SM and diel sections
+```
+
+## 1.6 Dereplicate, denoise, merge
+
+```{r ie-dada}
+derepFs.ie <- derepFastq(filtFs.ie, verbose = TRUE)
+derepRs.ie <- derepFastq(filtRs.ie, verbose = TRUE)
+names(derepFs.ie) <- sample.names.ie
+names(derepRs.ie) <- sample.names.ie
+
+dadaFs.ie <- dada(derepFs.ie, err = errF.ie, multithread = TRUE)
+dadaRs.ie <- dada(derepRs.ie, err = errR.ie, multithread = TRUE)
+
+mergers.ie <- mergePairs(dadaFs.ie, derepFs.ie, dadaRs.ie, derepRs.ie,
+                         minOverlap = 12, maxMismatch = 0, verbose = TRUE)
+```
+
+## 1.7 Sequence table, length filter, chimeras
+
+```{r ie-seqtab}
+seqtab.ie <- makeSequenceTable(mergers.ie)
+saveRDS(seqtab.ie, "seqtab_ch1_ie_16S.rds")
+table(nchar(getSequences(seqtab.ie)))
+
+seqtab2.ie <- seqtab.ie[, nchar(colnames(seqtab.ie)) %in% 245:265]
+saveRDS(seqtab2.ie, "seqtab2_ch1_ie_16S.rds")
+
+seqtab.nochim.ie <- removeBimeraDenovo(seqtab2.ie, method = "consensus",
+                                       multithread = TRUE, verbose = TRUE)
+dim(seqtab.nochim.ie)                       # previous run: 25 x 15785
+sum(seqtab.nochim.ie) / sum(seqtab2.ie)     # previous run: 0.962
+saveRDS(seqtab.nochim.ie, "seqtab.nochim_ch1_ie_16S.rds")
+```
+
+## 1.8 Read tracking
+
+```{r ie-track}
+track.ie <- cbind(out.ie, sapply(dadaFs.ie, getN), sapply(mergers.ie, getN),
+                  rowSums(seqtab2.ie), rowSums(seqtab.nochim.ie))
+colnames(track.ie) <- c("input", "filtered", "denoised", "merged", "tabled", "nonchim")
+rownames(track.ie) <- sample.names.ie
+write.csv(track.ie, "CH1_IE_2025_16S_readstats.csv", row.names = TRUE, quote = FALSE)
+```
+
+## 1.9 Taxonomy
+
+`addSpecies` needs more memory than a laptop has. It was run on the lab tower /
+OnDemand R session using the saved `taxa` object. ~ not enough classification at this taxonomic rank
+
+```{r ie-taxa}
+taxa.ie <- assignTaxonomy(seqtab.nochim.ie, silva, multithread = TRUE)
+saveRDS(taxa.ie, "CH1_IE_2025_16S_taxa.rds")
+
+taxa.plus.ie <- addSpecies(taxa.ie, silva_species, tryRC = TRUE, verbose = TRUE)
+saveRDS(taxa.plus.ie, "CH1_IE_2025_16S_taxa.plus.rds")
+```
+
+## 1.10 Phyloseq, cleaning, decontam
+
+```{r ie-phyloseq}
+samdf.ie <- read.csv("Metadata_CH1_IE.csv")
+rownames(samdf.ie) <- samdf.ie$Sample
+stopifnot(setequal(rownames(samdf.ie), rownames(seqtab.nochim.ie)))
+
+# Short ASV names; keep the sequence as an extra taxonomy column
+ids.ie   <- paste0("sq", seq_len(ncol(seqtab.nochim.ie)))
+taxa2.ie <- cbind(taxa.plus.ie, Sequence = rownames(taxa.plus.ie))
+colnames(seqtab.nochim.ie) <- ids.ie
+rownames(taxa2.ie) <- ids.ie
+
+ps.ie <- phyloseq(otu_table(seqtab.nochim.ie, taxa_are_rows = FALSE),
+                  sample_data(samdf.ie), tax_table(taxa2.ie))
+saveRDS(ps.ie, "ch1_ie_ps.rds")
+
+# Remove mitochondria, chloroplasts, non-bacteria
+ps.clean.ie <- subset_taxa(ps.ie, (Family != "Mitochondria") | is.na(Family))
+ps.clean.ie <- subset_taxa(ps.clean.ie, (Order != "Chloroplast") | is.na(Order))
+ps.clean.ie <- subset_taxa(ps.clean.ie, Kingdom == "Bacteria")
+saveRDS(ps.clean.ie, "ch1_ie_psclean.rds")
+
+# Library sizes (negative control should be lowest)
+df <- as.data.frame(sample_data(ps.clean.ie))
+df$LibrarySize <- sample_sums(ps.clean.ie)
+df <- df[order(df$LibrarySize), ]; df$Index <- seq(nrow(df))
+ggplot(df, aes(Index, LibrarySize, color = Sample.Type)) + geom_point()
+
+# Decontam (negative control = "16S")
+sample_data(ps.clean.ie)$is.neg <- sample_names(ps.clean.ie) == "16S"
+contam.ie <- isContaminant(ps.clean.ie, method = "prevalence",
+                           neg = "is.neg", threshold = 0.5)
+table(contam.ie$contaminant)                # previous run: 6 contaminants
+
+ps.cleaner.ie <- prune_taxa(!contam.ie$contaminant, ps.clean.ie)
+ps.cleaner.ie <- prune_samples(sample_names(ps.cleaner.ie) != "16S", ps.cleaner.ie)
+ps.cleaner.ie                               # previous run: 14162 taxa, 24 samples
+saveRDS(ps.cleaner.ie, "CH1_IE_16S_ps.cleaner.RDS")   # USED FOR STATS
+```
+
+---
+
+# 2. Seasonal mats (corrected: one error model per MiSeq run)
+
+- Run 10828 = seasonal samples before August 2024 (`MM_SM_*`)
+- Run 11002 = August 2024 (`MM_A24SM_*`) + Summer 2025 (`MM_J25SM_*`)
+
+Each sample is denoised on its own. That gives the same result as `dada()` on
+all samples together, because the default is `pool = FALSE`. Every result is
+saved to `SM_byrun_checkpoints/`. If R crashes, restart and run again: samples
+that are already done are skipped.
+
+## 2.1 Remove reads with Ns (filtN), primer check, quality profiles
+
+```{r sm-filtN}
+fnFs.sm <- sort(list.files(sm_path, pattern = "_R1_16S_final.fastq", full.names = TRUE))
+fnRs.sm <- sort(list.files(sm_path, pattern = "_R2_16S_final.fastq", full.names = TRUE))
+length(fnFs.sm)                             # want 77
+
+fnFs.filtN.sm <- file.path(sm_path, "filtN", basename(fnFs.sm))
+fnRs.filtN.sm <- file.path(sm_path, "filtN", basename(fnRs.sm))
+for (i in seq(1, length(fnFs.sm), by = 5)) {          # chunks of 5 to save memory
+  inds <- i:min(i + 4, length(fnFs.sm))
+  inds <- inds[!file.exists(fnFs.filtN.sm[inds])]     # skip finished files
+  if (length(inds)) filterAndTrim(fnFs.sm[inds], fnFs.filtN.sm[inds],
+                                  fnRs.sm[inds], fnRs.filtN.sm[inds],
+                                  maxN = 0, multithread = TRUE, compress = TRUE)
+}
+
+primerTable(fnFs.filtN.sm[[4]], fnRs.filtN.sm[[4]])   # all 0: no primers
+
+plotQualityGroups(fnFs.filtN.sm)
+plotQualityGroups(fnRs.filtN.sm)
+# truncLen = c(220, 220)
+```
+
+## 2.2 Filter and trim (only samples whose trimmed files are missing)
+
+```{r sm-trim}
+trim_path  <- file.path(sm_path, "trimmed")
+outsm_file <- "outsm.csv"                   # filterAndTrim read counts
+samdf_file <- "SM_SAMDF4.csv"               # corrected metadata
+ckpt       <- "SM_byrun_checkpoints"
+dir.create(trim_path, showWarnings = FALSE)
+dir.create(ckpt, showWarnings = FALSE)
+
+fnF <- fnFs.sm
+fnR <- fnRs.sm
+sample.names <- sub("_R1_16S_final.fastq.*$", "", basename(fnF))
+stopifnot(identical(sample.names, sub("_R2_16S_final.fastq.*$", "", basename(fnR))))
+
+filtF <- file.path(trim_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtR <- file.path(trim_path, paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtF) <- sample.names
+names(filtR) <- sample.names
+
+todo <- which(!file.exists(filtF) | !file.exists(filtR))
+message(length(todo), " samples need filterAndTrim")
+for (i in todo) {
+  o <- filterAndTrim(fnF[i], filtF[i], fnR[i], filtR[i],
+                     truncLen = c(220, 220), maxN = 0, maxEE = c(2, 2),
+                     truncQ = 2, rm.phix = TRUE, matchIDs = TRUE,
+                     compress = TRUE, multithread = TRUE)
+  saveRDS(o, file.path(ckpt, paste0("filt_", sample.names[i], ".rds")))
+}
+
+# Input/filtered read counts for tracking
+if (file.exists(outsm_file)) {
+  outsm <- read.csv(outsm_file, row.names = 1)
+  rownames(outsm) <- sub("_R1_16S_final.fastq.*$", "", rownames(outsm))
+} else {
+  outsm <- matrix(NA_real_, nrow = length(sample.names), ncol = 2,
+                  dimnames = list(sample.names, c("reads.in", "reads.out")))
+  for (s in sample.names) {
+    f <- file.path(ckpt, paste0("filt_", s, ".rds"))
+    if (file.exists(f)) outsm[s, ] <- readRDS(f)[1, ]
+  }
+  message("outsm file not found: input/filtered counts are NA for reused trimmed files")
+}
+head(outsm)
+
+# Samples that lost every read in filtering cannot be denoised
+keep <- file.exists(filtF) & file.exists(filtR)
+filtF <- filtF[keep]; filtR <- filtR[keep]; sample.names <- sample.names[keep]
+```
+
+## 2.3 Assign runs
+
+```{r sm-runs}
+run <- rep(NA_character_, length(sample.names))
+run[grepl("^MM_SM_", sample.names)]               <- "R10828"
+run[grepl("^MM_A24SM_|^MM_J25SM_", sample.names)] <- "R11002"
+run[sample.names == "MM_NEG_F4"]  <- "R11002"   # CONFIRM: negative on run 11002
+run[sample.names == "MM_NEG_H12"] <- "R10828"   # CONFIRM: negative on run 10828
+names(run) <- sample.names
+print(table(run, useNA = "ifany"))
+stopifnot(!any(is.na(run)))
+```
+
+## 2.4 Error models, one per run (~20-40 min each; saved once)
+
+```{r sm-errors}
+for (r in unique(run)) {
+  f <- file.path(ckpt, paste0("err_", r, ".rds"))
+  if (file.exists(f)) next
+  set.seed(100)
+  errF <- learnErrors(filtF[run == r], multithread = TRUE, randomize = TRUE)
+  errR <- learnErrors(filtR[run == r], multithread = TRUE, randomize = TRUE)
+  saveRDS(list(errF = errF, errR = errR), f)
+  rm(errF, errR); gc()
+}
+
+pdf("SM_error_plots_by_run.pdf")
+for (r in unique(run)) {
+  e <- readRDS(file.path(ckpt, paste0("err_", r, ".rds")))
+  print(plotErrors(e$errF, nominalQ = TRUE) + ggtitle(paste(r, "forward")))
+  print(plotErrors(e$errR, nominalQ = TRUE) + ggtitle(paste(r, "reverse")))
+}
+dev.off()
+```
+
+## 2.5 Denoise and merge, one sample at a time (resumable)
+
+```{r sm-dada}
+err <- lapply(setNames(unique(run), unique(run)),
+              function(r) readRDS(file.path(ckpt, paste0("err_", r, ".rds"))))
+
+for (s in sample.names) {
+  f <- file.path(ckpt, paste0("merged_", s, ".rds"))
+  if (file.exists(f)) next
+  message("Denoising ", s, " (", run[s], ")  ",
+          which(sample.names == s), " of ", length(sample.names))
+  e  <- err[[run[s]]]
+  dF <- dada(filtF[[s]], err = e$errF, multithread = TRUE)
+  dR <- dada(filtR[[s]], err = e$errR, multithread = TRUE)
+  mg <- mergePairs(dF, filtF[[s]], dR, filtR[[s]],
+                   minOverlap = 12, maxMismatch = 0)
+  saveRDS(list(merged   = mg,
+               denoised = sum(getUniques(dF)),
+               nmerged  = sum(mg$abundance)), f)
+  rm(dF, dR, mg); gc()
+}
+```
+
+## 2.6 Sequence table, length filter, chimeras, read tracking
+
+```{r sm-seqtab}
+res <- lapply(setNames(sample.names, sample.names),
+              function(s) readRDS(file.path(ckpt, paste0("merged_", s, ".rds"))))
+
+seqtab <- makeSequenceTable(lapply(res, `[[`, "merged"))
+saveRDS(seqtab, "SM_seqtab_byrun.rds")
+dim(seqtab)
+table(nchar(getSequences(seqtab)))
+
+seqtab2 <- seqtab[, nchar(colnames(seqtab)) %in% 245:265]
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method = "consensus",
+                                    multithread = TRUE, verbose = TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim) / sum(seqtab2)
+saveRDS(seqtab.nochim, "SM_seqtab.nochim_byrun.rds")
+
+trk <- data.frame(run      = run[sample.names],
+                  input    = outsm[sample.names, 1],
+                  filtered = outsm[sample.names, 2],
+                  denoised = sapply(res, `[[`, "denoised"),
+                  merged   = sapply(res, `[[`, "nmerged"),
+                  tabled   = rowSums(seqtab2)[sample.names],
+                  nonchim  = rowSums(seqtab.nochim)[sample.names],
+                  row.names = sample.names)
+trk$merge_rate <- trk$merged / trk$denoised
+trk$kept       <- trk$nonchim / trk$input
+write.csv(trk, "SM_16S_readstats_byrun.csv")
+print(aggregate(cbind(kept, merge_rate) ~ run, data = trk, FUN = mean))
+print(head(trk[order(trk$merge_rate), ], 10))   # lowest merge rates
+
+rm(res, seqtab, seqtab2); gc()
+```
+
+## 2.7 Taxonomy in chunks of 2,000 ASVs (resumable)
+
+```{r sm-taxa}
+seqs   <- colnames(seqtab.nochim)
+chunks <- split(seqs, ceiling(seq_along(seqs) / 2000))
+for (k in seq_along(chunks)) {
+  f <- file.path(ckpt, paste0("taxa_chunk_", k, ".rds"))
+  if (file.exists(f)) next
+  message("Taxonomy chunk ", k, " of ", length(chunks))
+  set.seed(100)
+  saveRDS(assignTaxonomy(chunks[[k]], silva, multithread = TRUE), f)
+  gc()
+}
+taxa <- do.call(rbind, lapply(seq_along(chunks), function(k)
+  readRDS(file.path(ckpt, paste0("taxa_chunk_", k, ".rds")))))
+stopifnot(identical(rownames(taxa), seqs))
+saveRDS(taxa, "SM_16S_taxa_byrun.rds")
+```
+
+## 2.8 Phyloseq, cleaning, decontam
+
+Decontam uses `batch = "Run"`, so each run is checked against its own negative.
+
+```{r sm-phyloseq}
+samdf <- read.csv(samdf_file)
+samdf[] <- lapply(samdf, function(x) if (is.character(x)) trimws(x) else x)
+rownames(samdf) <- samdf$Sample.ID
+samdf$Run <- run[rownames(samdf)]
+stopifnot(setequal(rownames(samdf), rownames(seqtab.nochim)))
+print(table(samdf$Month, samdf$Run, useNA = "ifany"))
+
+ids   <- paste0("sq", seq_len(ncol(seqtab.nochim)))
+taxa2 <- cbind(taxa, Sequence = rownames(taxa))
+colnames(seqtab.nochim) <- ids
+rownames(taxa2) <- ids
+
+ps.sm <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows = FALSE),
+                  sample_data(samdf), tax_table(taxa2))
+saveRDS(ps.sm, "sm.ps.byrun.raw.rds")
+
+ps.sm <- subset_taxa(ps.sm, (Family != "Mitochondria") | is.na(Family))
+ps.sm <- subset_taxa(ps.sm, (Order  != "Chloroplast")  | is.na(Order))
+ps.sm <- subset_taxa(ps.sm, Kingdom == "Bacteria")
+
+# Library sizes (negatives should be lowest)
+df <- as.data.frame(sample_data(ps.sm))
+df$LibrarySize <- sample_sums(ps.sm)
+df <- df[order(df$LibrarySize), ]; df$Index <- seq(nrow(df))
+ggplot(df, aes(Index, LibrarySize, color = Month, shape = Run)) + geom_point()
+
+negs.sm <- c("MM_NEG_F4", "MM_NEG_H12")
+sample_data(ps.sm)$is.neg <- sample_names(ps.sm) %in% negs.sm
+contam.sm <- isContaminant(ps.sm, method = "prevalence", neg = "is.neg",
+                           batch = "Run", threshold = 0.5)
+print(table(contam.sm$contaminant))
+
+ps.sm <- prune_taxa(!contam.sm$contaminant, ps.sm)
+ps.sm <- prune_samples(!(sample_names(ps.sm) %in% negs.sm), ps.sm)
+ps.sm <- prune_taxa(taxa_sums(ps.sm) > 0, ps.sm)
+ps.sm
+saveRDS(ps.sm, "sm.ps.cleaner.byrun.rds")   # USED FOR STATS
+```
+
+---
+
+# 3. Diel
+
+## 3.1 Files, filtN, primer check, quality profiles
+
+```{r diel-filtN}
+fnFsdi <- sort(list.files(diel_path, pattern = "_R1_16S_final.fastq", full.names = TRUE))
+fnRsdi <- sort(list.files(diel_path, pattern = "_R2_16S_final.fastq", full.names = TRUE))
+sample.namesdi <- sapply(strsplit(basename(fnFsdi), "_R1_"), `[`, 1)
+length(fnFsdi)                              # want 36
+
+fnFsdi.filtN <- file.path(diel_path, "filtN", basename(fnFsdi))
+fnRsdi.filtN <- file.path(diel_path, "filtN", basename(fnRsdi))
+for (i in seq(1, length(fnFsdi), by = 5)) {
+  inds <- i:min(i + 4, length(fnFsdi))
+  filterAndTrim(fnFsdi[inds], fnFsdi.filtN[inds], fnRsdi[inds], fnRsdi.filtN[inds],
+                maxN = 0, multithread = TRUE, compress = TRUE)
+}
+
+primerTable(fnFsdi.filtN[[4]], fnRsdi.filtN[[4]])     # all 0: no primers
+
+plotQualityGroups(fnFsdi.filtN)
+plotQualityGroups(fnRsdi.filtN)
+# truncLen = c(220, 220)
+```
+
+## 3.2 Filter and trim
+
+```{r diel-trim}
+filtFsdi <- file.path(diel_path, "trimmed", paste0(sample.namesdi, "_F_filt.fastq.gz"))
+filtRsdi <- file.path(diel_path, "trimmed", paste0(sample.namesdi, "_R_filt.fastq.gz"))
+
+outdi <- data.frame()
+for (i in seq(1, length(fnFsdi), by = 5)) {
+  inds <- i:min(i + 4, length(fnFsdi))
+  outdi <- rbind(outdi, filterAndTrim(fnFsdi[inds], filtFsdi[inds],
+                                      fnRsdi[inds], filtRsdi[inds],
+                                      truncLen = c(220, 220), maxN = 0,
+                                      maxEE = c(2, 2), truncQ = 2,
+                                      rm.phix = TRUE, matchIDs = TRUE,
+                                      compress = TRUE, multithread = TRUE))
+}
+write.csv(outdi, "outdi.csv", row.names = TRUE, quote = FALSE)
+```
+
+## 3.3 Error rates
+
+```{r diel-errors}
+errFdi <- learnErrors(filtFsdi, multithread = TRUE)
+errRdi <- learnErrors(filtRsdi, multithread = TRUE)
+saveRDS(errFdi, "errFdi.rds"); saveRDS(errRdi, "errRdi.rds")
+plotErrors(errFdi, nominalQ = TRUE)
+plotErrors(errRdi, nominalQ = TRUE)
+```
+
+## 3.4 Dereplicate, denoise, merge (run on the cluster for memory)
+
+```{r diel-dada}
+derepFsdi <- derepFastq(filtFsdi, verbose = TRUE)
+derepRsdi <- derepFastq(filtRsdi, verbose = TRUE)
+names(derepFsdi) <- sample.namesdi
+names(derepRsdi) <- sample.namesdi
+
+dadaFsdi <- dada(derepFsdi, err = errFdi, multithread = TRUE)
+dadaRsdi <- dada(derepRsdi, err = errRdi, multithread = TRUE)
+saveRDS(dadaFsdi, "dadaFsdi.rds"); saveRDS(dadaRsdi, "dadaRsdi.rds")
+
+mergers2 <- mergePairs(dadaFsdi, derepFsdi, dadaRsdi, derepRsdi,
+                       minOverlap = 12, maxMismatch = 0, verbose = TRUE)
+```
+
+## 3.5 Sequence table, length filter, chimeras, read tracking
+
+```{r diel-seqtab}
+seqtabdi <- makeSequenceTable(mergers2)
+dim(seqtabdi)                               # previous run: 36 x 13695
+saveRDS(seqtabdi, "seqtab_DIEL_16S.rds")
+table(nchar(getSequences(seqtabdi)))
+
+seqtab2di <- seqtabdi[, nchar(colnames(seqtabdi)) %in% 245:265]
+saveRDS(seqtab2di, "seqtab2_DIEL_16S.rds")
+
+seqtab.nochimdi <- removeBimeraDenovo(seqtab2di, method = "consensus",
+                                      multithread = TRUE, verbose = TRUE)
+dim(seqtab.nochimdi)                        # previous run: 36 x 12392
+sum(seqtab.nochimdi) / sum(seqtab2di)       # previous run: 0.960
+saveRDS(seqtab.nochimdi, "seqtab.nochim_DIEL_16S.rds")
+
+trackdi <- cbind(outdi, sapply(dadaFsdi, getN), sapply(mergers2, getN),
+                 rowSums(seqtab2di), rowSums(seqtab.nochimdi))
+colnames(trackdi) <- c("input", "filtered", "denoised", "merged", "tabled", "nonchim")
+rownames(trackdi) <- sample.namesdi
+write.csv(trackdi, "DIEL_16S_readstats.csv", row.names = TRUE, quote = FALSE)
+```
+
+## 3.6 Taxonomy
+
+```{r diel-taxa}
+taxadi <- assignTaxonomy(seqtab.nochimdi, silva, multithread = TRUE)
+saveRDS(taxadi, "DIEL_16S_taxa.rds")
+```
+
+## 3.7 Phyloseq, cleaning, decontam
+
+```{r diel-phyloseq}
+samdfdi <- read.csv("DIEL_SAMDF.csv")
+samdfdi[] <- lapply(samdfdi, function(x) if (is.character(x)) trimws(x) else x)
+rownames(samdfdi) <- samdfdi$Sample.ID
+stopifnot(setequal(rownames(samdfdi), rownames(seqtab.nochimdi)))
+
+idsdi   <- paste0("sq", seq_len(ncol(seqtab.nochimdi)))
+taxa2di <- cbind(taxadi, Sequence = rownames(taxadi))
+colnames(seqtab.nochimdi) <- idsdi
+rownames(taxa2di) <- idsdi
+
+psdi <- phyloseq(otu_table(seqtab.nochimdi, taxa_are_rows = FALSE),
+                 sample_data(samdfdi), tax_table(taxa2di))
+saveRDS(psdi, "ps.diel.update.rds")
+
+ps.clean.DI <- subset_taxa(psdi, (Family != "Mitochondria") | is.na(Family))
+ps.clean.DI <- subset_taxa(ps.clean.DI, (Order != "Chloroplast") | is.na(Order))
+ps.clean.DI <- subset_taxa(ps.clean.DI, Kingdom == "Bacteria")
+saveRDS(ps.clean.DI, "diel.psclean.rds")
+
+# Library sizes
+df <- as.data.frame(sample_data(ps.clean.DI))
+df$LibrarySize <- sample_sums(ps.clean.DI)
+df <- df[order(df$LibrarySize), ]; df$Index <- seq(nrow(df))
+ggplot(df, aes(Index, LibrarySize, color = Diel_Time)) + geom_point()
+
+# Decontam (negative control = MM_NEG_F4)
+sample_data(ps.clean.DI)$is.neg <- sample_names(ps.clean.DI) == "MM_NEG_F4"
+contamdi <- isContaminant(ps.clean.DI, method = "prevalence",
+                          neg = "is.neg", threshold = 0.5)
+table(contamdi$contaminant)                 # previous run: 5 contaminants
+
+ps.cleaner.diel <- prune_taxa(!contamdi$contaminant, ps.clean.DI)
+ps.cleaner.diel <- prune_samples(sample_names(ps.cleaner.diel) != "MM_NEG_F4",
+                                 ps.cleaner.diel)
+ps.cleaner.diel                             # previous run: 11007 taxa, 35 samples
+saveRDS(ps.cleaner.diel, "diel.ps.cleaner.rds")   # USED FOR STATS
+```
+
+---
+
+# Final objects for downstream stats
+
+| Experiment        | File                         |
+|-------------------|------------------------------|
+| Internal/External | `CH1_IE_16S_ps.cleaner.RDS`  |
+| Seasonal mats     | `sm.ps.cleaner.byrun.rds`    |
+| Diel              | `diel.ps.cleaner.rds`        |
