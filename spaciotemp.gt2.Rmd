@@ -1,0 +1,470 @@
+---
+title: "spaciotemp.git2"
+output: html_document
+date: "2026-11-24"
+---
+
+Space & Time 
+
+(1) PCA plot for compositional data
+(2) Diversity stats for Internal/External Mat samples
+(3) Diversity stats for Diel 
+(4) Diversity stats for Seasonal 
+
+```{r}
+getwd()
+```
+
+~
+SET UP ALL EXPERIMENTS
+~
+
+```{r}
+pca.df <- read.csv("pca.df.update copy.csv")
+library(phyloseq)
+
+ie.ps.cleaner <- readRDS("CH1_IE_16S_ps.cleaner copy.RDS")
+di.ps.cleaner <- readRDS("diel.ps.cleaner copy.rds")
+sm.ps.cleaner <- readRDS("sm.ps.cleaner.byrun.rds")
+
+look <- function(ps, name) {
+  cat("\n\n==========", name, "==========\n")
+  print(ps)                                            # taxa, samples, variables
+
+  cat("\nSample names:\n");      print(sample_names(ps))
+  cat("\nMetadata columns:\n");  print(colnames(sample_data(ps)))
+  cat("\nTaxonomy columns:\n");  print(colnames(tax_table(ps)))
+
+  cat("\nReads per sample (lowest 5):\n")
+  print(head(sort(sample_sums(ps)), 5))
+  cat("Read range:", range(sample_sums(ps)), "\n")
+
+  cat("\nASVs with zero reads:", sum(taxa_sums(ps) == 0), "\n")
+
+  cat("\nKingdom counts:\n")
+  print(table(tax_table(ps)[, "Kingdom"], useNA = "ifany"))
+
+  cat("\nSamples per group, for each metadata column:\n")
+  sd <- data.frame(sample_data(ps))
+  for (v in names(sd)) {
+    if (length(unique(sd[[v]])) < 20) {
+      cat("\n", v, ":\n"); print(table(sd[[v]], useNA = "ifany"))
+    }
+  }
+}
+
+look(ie.ps.cleaner, "Internal/External")
+look(di.ps.cleaner, "Diel")
+look(sm.ps.cleaner, "Seasonal")
+```
+
+Internal/External: (24 samples; 14,135 ASVs, between 39,249 and 177,990 reads/sample)
+Diel: (35 samples; 10,910 ASVs, between 64,854 and 230,257 reads/sample)
+Seasonal: (75 samples; 20,833 ASVs, between 13,402 and 197,095 reads/sample)
+
+~
+Internal/External Set Up
+~
+
+```{r}
+library(phyloseq); library(tidyverse)
+
+# ---- prune zero ASVs, rename sequence column ----
+ie.ps <- prune_taxa(taxa_sums(ie.ps.cleaner) > 0, ie.ps.cleaner)
+tt <- tax_table(ie.ps); colnames(tt)[colnames(tt) == "V8"] <- "Sequence"
+tax_table(ie.ps) <- tt
+ntaxa(ie.ps)                                   # 14162 - 27 = 14135
+
+# ---- metadata ----
+sd <- data.frame(sample_data(ie.ps))
+sd$is.neg <- NULL
+sd$Sample.Type <- factor(sd$Sample.Type, levels = c("Internal", "External"))
+sd$Site        <- factor(sd$Site)
+sd$MatID       <- factor(paste(sd$Site, sd$Mat, sep = "_"))   # unique mat ID
+sample_data(ie.ps) <- sample_data(sd)
+
+# ---- check the pairing ----
+table(sd$MatID, sd$Sample.Type)    # every row should be 1 1
+table(sd$Site, sd$Sample.Type)     # 6 6 / 6 6
+```
+ 
+```{r}
+sd <- data.frame(sample_data(ie.ps))
+sd$Mat[sd$Sample %in% c("D7", "D8")] <- 8
+sd$MatID <- factor(paste(sd$Site, sd$Mat, sep = "_"))
+sample_data(ie.ps) <- sample_data(sd)
+
+table(sd$MatID, sd$Sample.Type)   # every row should now be 1 1
+```
+```{r}
+samdf.ie <- read.csv("Metadata_CH1_IE copy.csv")
+
+# fix the duplicated mat number
+samdf.ie$Mat[samdf.ie$Sample %in% c("D7", "D8")] <- 8
+
+# unique mat ID for the paired design (negative control gets NA)
+samdf.ie$MatID <- ifelse(is.na(samdf.ie$Mat), NA,
+                         paste(samdf.ie$Site, samdf.ie$Mat, sep = "_"))
+
+# check: every mat should have 1 Internal + 1 External
+table(samdf.ie$MatID, samdf.ie$Sample.Type)
+
+write.csv(samdf.ie, "Metadata_CH1_IE_v2.csv", row.names = FALSE)
+samdf.ie <- samdf.ie[-1, ]
+View(samdf.ie)
+```
+ 
+
+ 
+ Internal External
+  SB        6        6
+  TM        6        6
+
+
+Summary: 
+- 24 samples
+- 14,135 ASVs (14162 - 27 = 14135) ~ 27 0 asvs across all samples (prune_taxa)
+- 39,249–177,990 reads per sample.
+- Design: 12 mats (6 at SB, 6 at TM). Each mat has one internal and one external sample, so the design is paired by MatID.
+- Object: ie.ps, with zero-read ASVs pruned, V8 renamed to Sequence, and Sample.Type, Site and MatID set as factors.
+
+~
+DIEL Set Up
+~
+```{r}
+library(phyloseq); library(tidyverse)
+
+# ---- prune zero ASVs, rename sequence column ----
+di.ps <- prune_taxa(taxa_sums(di.ps.cleaner) > 0, di.ps.cleaner)
+tt <- tax_table(di.ps); colnames(tt)[colnames(tt) == "V7"] <- "Sequence"
+tax_table(di.ps) <- tt
+ntaxa(di.ps)                                   # 11007 - 97 = 10910
+
+# ---- metadata ----
+sd.di <- data.frame(sample_data(di.ps))
+sd.di$is.neg <- NULL
+unique(sd.di$Diel_Time)                        # check raw labels before factoring
+
+sd.di$Diel_Time     <- factor(sd.di$Diel_Time, levels = 0:6)   # 7 time points
+sd.di$Diel_Time_num <- as.numeric(as.character(sd.di$Diel_Time))
+stopifnot(!anyNA(sd.di$Diel_Time))
+sample_data(di.ps) <- sample_data(sd.di)
+
+# ---- check the design ----
+table(sd.di$Diel_Time)                         # 5 per time point
+table(sd.di$Month_Year)                        # all July_2024
+
+View(sd.di)
+```
+
+```{r}
+ ntaxa(sm.ps) - ntaxa(sm.tm.ps)     # ASVs removed for the TM-only subset
+ntaxa(sm.ps) - ntaxa(sm.both.ps)   # ASVs removed for the two-site subset
+```
+
+- 10,910 ASVs after removing the 97 with zero reads, which matches the expected 11,007 − 97.
+- 7 time points, 0–6. The labels were clean numbers, so they converted to a factor without problems.
+- 5 samples at every time point, so the design is fully balanced with 35 samples.
+- Independent samples (taken from different mats) 
+- All samples are from July 2024, so there's no month effect to account for. 
+
+~
+SEASONAL Set Up
+~
+```{r}
+library(phyloseq); library(tidyverse)
+
+# ---- check zero ASVs and taxonomy columns (both already clean) ----
+sm.ps <- prune_taxa(taxa_sums(sm.ps.cleaner) > 0, sm.ps.cleaner)
+ntaxa(sm.ps)                                   # 20833 (no zero ASVs)
+colnames(tax_table(sm.ps))                     # Kingdom ... Genus, Sequence
+
+# ---- metadata ----
+sd.sm <- data.frame(sample_data(sm.ps))
+sd.sm$is.neg <- NULL
+sd.sm[] <- lapply(sd.sm, function(x) if (is.character(x)) trimws(x) else x)
+unique(sd.sm$Month)                            # check raw labels before factoring
+
+# months in time order
+month_order <- c("June_2023", "July_2023", "October_2023", "December_2023",
+                 "February_2024", "April_2024", "June_2024", "August_2024",
+                 "July_2025")
+sd.sm$Month <- factor(sd.sm$Month, levels = month_order)
+
+# season
+sd.sm$Season <- case_when(
+  grepl("^(June|July|August)", sd.sm$Month) ~ "Summer",
+  grepl("^October",            sd.sm$Month) ~ "Fall",
+  grepl("^(December|February)", sd.sm$Month) ~ "Winter",
+  grepl("^April",              sd.sm$Month) ~ "Spring")
+sd.sm$Season <- factor(sd.sm$Season, levels = c("Summer", "Fall", "Winter", "Spring"))
+
+sd.sm$Site <- factor(sd.sm$Site)
+sd.sm$Run  <- factor(sd.sm$Run)
+sd.sm$NUT[sd.sm$NUT == ""] <- NA               # blanks -> NA
+
+stopifnot(!anyNA(sd.sm$Month), !anyNA(sd.sm$Season))
+sample_data(sm.ps) <- sample_data(sd.sm)
+
+# ---- check the design ----
+table(sd.sm$Month, sd.sm$Site)                 # samples per month x site
+table(sd.sm$Month, sd.sm$Run)                  # Aug 2024 + Jul 2025 = R11002
+table(sd.sm$Season, sd.sm$Site)
+View(sd.sm)
+```
+
+Seasonal: 
+- 75 samples
+- 20,833 ASVs
+- between 13,402 and 197,095 reads/sample
+- 9 months (June 2023–July 2025)
+- 2 sites.
+
+                 SB TM
+  June_2023      0  5
+  July_2023      0  5
+  October_2023   5  5
+  December_2023  4  5
+  February_2024  5  5
+  April_2024     5  5
+  June_2024      5  5
+  August_2024    5  5
+  July_2025      0  6
+               
+               
+What the design tells you:
+- TM is the full time series. It was sampled in all 9 months, almost always with 5 samples (46 total).
+- SB was sampled only from October 2023 to August 2024, 6 months ~ All of those months have 5 samples except December, which has 4.
+- Both sites were sampled together in only those 6 months. So Site and Month can't both go in one model across all 9 months, because SB is missing June and July 2023 and July 2025.
+- Season mostly repeats Month. Fall and spring are one month each, and summer is mostly TM-only months, so the season comparison is lopsided (36 summer samples vs 10 fall). Use Month as the variable tested, and Season only for interpretation/plot colors.
+
+subsetting for seasonal!!!
+```{r}
+# ---- subset 1: TM time series, all 9 months ----
+sm.tm.ps <- subset_samples(sm.ps, Site == "TM")
+sm.tm.ps <- prune_taxa(taxa_sums(sm.tm.ps) > 0, sm.tm.ps)
+sample_data(sm.tm.ps)$Month <- droplevels(sample_data(sm.tm.ps)$Month)
+nsamples(sm.tm.ps); ntaxa(sm.tm.ps)            # 46 samples
+
+# ---- subset 2: both sites, Oct 2023 - Aug 2024 ----
+both_months <- c("October_2023", "December_2023", "February_2024",
+                 "April_2024", "June_2024", "August_2024")
+sm.both.ps <- subset_samples(sm.ps, Month %in% both_months)
+sm.both.ps <- prune_taxa(taxa_sums(sm.both.ps) > 0, sm.both.ps)
+sample_data(sm.both.ps)$Month <- droplevels(sample_data(sm.both.ps)$Month)
+nsamples(sm.both.ps); ntaxa(sm.both.ps)        # 59 samples
+table(sample_data(sm.both.ps)$Month, sample_data(sm.both.ps)$Site)
+```
+Summary lines~
+* sm.tm.ps ~ Seasonal, TM time series: 46 samples; 15,130 ASVs; 9 months
+* sm.both.ps ~ Seasonal, two-site comparison: 59 samples; 17,796 ASVs; 6 months × 2 sites
+
+
+~
+CHOOSING TAXONOMIC RANK
+~
+the percentage of ASVs and the percentage of reads with a name at each taxonomic level:
+```{r}
+tax_assigned <- function(ps) {
+  tt    <- as.data.frame(tax_table(ps))
+  reads <- taxa_sums(ps)
+  ranks <- c("Phylum", "Class", "Order", "Family", "Genus")
+  data.frame(
+    Rank      = ranks,
+    pct_ASVs  = sapply(ranks, function(r) round(100 * mean(!is.na(tt[[r]])), 1)),
+    pct_reads = sapply(ranks, function(r) round(100 * sum(reads[!is.na(tt[[r]])]) / sum(reads), 1)),
+    row.names = NULL)
+}
+
+tax_pct <- bind_rows(
+  `Internal/External` = tax_assigned(ie.ps),
+  Diel                = tax_assigned(di.ps),
+  Seasonal            = tax_assigned(sm.ps),
+  .id = "Experiment")
+
+tax_pct
+tax_pct |> select(-pct_ASVs) |> pivot_wider(names_from = Rank, values_from = pct_reads)  # reads, side by side
+```
+*class for all 
+Internal/External	Phylum	95.8	
+Internal/External	Class	90.5	
+Internal/External	Order	77.8	
+Internal/External	Family	61.2	
+Internal/External	Genus	32.6	
+
+Diel	Phylum	95.6		
+Diel	Class	90.8
+Diel	Order	78.2	
+Diel	Family	61.2
+Diel	Genus	32.5
+
+Seasonal	Phylum	96.0	
+Seasonal	Class	91.3
+Seasonal	Order	78.5		
+Seasonal	Family	61.9	
+Seasonal	Genus	32.4	
+
+~
+BAR PLOTS
+~
+function all together, but using individual phyloseq objects for each 
+
+(1) Rare grouped, means	
+(2) All taxa, means	
+(3) Rare grouped, every sample
+
+Internal/External	
+Internal vs External, panels by Site	
+same	
+panels Site × Type, both panels in the same mat order
+
+Diel	
+7 time points	
+same	
+panels by time point
+
+Seasonal	
+9 months, a row per Site
+same	
+Site rows × Month columns
+
+```{r}
+library(phyloseq); library(tidyverse)
+
+# ---- Class-level data ----
+rare_lab  <- "Rare taxa (< 1%)"
+unass_lab <- "Unassigned at Class level"
+
+make_class_data <- function(ps, vars, rare_cut = 0.01) {
+  keys <- c("Sample", vars, "Class")
+  df <- ps %>% tax_glom("Class", NArm = FALSE) %>%
+    transform_sample_counts(function(x) x / sum(x)) %>% psmelt()
+  df$Class <- ifelse(is.na(df$Class), unass_lab, df$Class)
+  df <- df %>% group_by(across(all_of(keys))) %>%
+    summarise(Abundance = sum(Abundance), .groups = "drop")
+  if (!is.null(rare_cut)) {
+    keep <- df %>% group_by(Class) %>% summarise(m = mean(Abundance)) %>%
+      filter(m >= rare_cut) %>% pull(Class)
+    df <- df %>% mutate(Class = ifelse(Class %in% keep, Class, rare_lab)) %>%
+      group_by(across(all_of(keys))) %>%
+      summarise(Abundance = sum(Abundance), .groups = "drop")
+  }
+  df
+}
+
+bar_data <- list(
+  IE = list(rare = make_class_data(ie.ps, c("Site", "Sample.Type", "MatID"), 0.01),
+            all  = make_class_data(ie.ps, c("Site", "Sample.Type", "MatID"), NULL)),
+  DI = list(rare = make_class_data(di.ps, "Diel_Time", 0.01),
+            all  = make_class_data(di.ps, "Diel_Time", NULL)),
+  SM = list(rare = make_class_data(sm.ps, c("Site", "Month"), 0.01),
+            all  = make_class_data(sm.ps, c("Site", "Month"), NULL)))
+
+# ---- colours, shared across all three experiments ----
+distinct_palette <- c(
+  "#1f78b4", "#FF69B4", "#33a02c", "#ff7f00", "#984ea3", "#e41a1c",
+  "#4ea3d9", "#b07cc6", "#66c2a5", "#a65628", "#f781bf", "#238b45",
+  "#6a3d9a", "#e6ab02", "#00a6d6", "#d95f02", "#8c6bb1", "#41ae76",
+  "#fb6a4a", "#377eb8", "#cab2d6", "#b15928", "#74c476", "#e7298a",
+  "#ffd92f", "#006d2c", "#a6cee3", "#d4b9da", "#ff9933", "#7b3294")
+special_colors <- setNames(c("grey70", "darkblue"), c(rare_lab, unass_lab))
+
+kept_taxa <- sort(setdiff(unique(unlist(map(bar_data, ~ .x$rare$Class))), names(special_colors)))
+all_taxa  <- sort(setdiff(unique(unlist(map(bar_data, ~ .x$all$Class))),  names(special_colors)))
+rest_taxa <- setdiff(all_taxa, kept_taxa)
+
+pal <- rep(distinct_palette, length.out = length(kept_taxa) + length(rest_taxa))
+class_cols <- c(setNames(pal, c(kept_taxa, rest_taxa)), special_colors)
+if (length(kept_taxa) > length(distinct_palette))
+  warning("More than 30 Classes pass 1% – colours repeat in the rare-grouped plots too")
+
+# legend / stack order: alphabetical, then Unassigned, then Rare taxa
+order_classes <- function(x) {
+  present <- unique(x)
+  factor(x, levels = c(sort(setdiff(present, names(special_colors))),
+                       intersect(c(unass_lab, rare_lab), present)))
+}
+
+nice_lab  <- function(z) gsub("_", " ", z)        # "June_2023" -> "June 2023"
+bar_theme <- theme_classic(base_size = 11) + theme(legend.key.size = unit(0.35, "cm"))
+
+# ---- plot functions ----
+# (1) and (2): mean relative abundance per group
+plot_mean <- function(df, x, facet = NULL, xlab = x, title, legend_cols = 1) {
+  d <- df %>% group_by(across(all_of(c(facet, x, "Class")))) %>%
+    summarise(Abundance = mean(Abundance), .groups = "drop") %>%
+    mutate(Class = order_classes(Class))
+  p <- ggplot(d, aes(.data[[x]], Abundance, fill = Class)) +
+    geom_col(width = 0.8) +
+    scale_fill_manual(values = class_cols) +
+    scale_x_discrete(labels = nice_lab) +
+    scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
+    labs(x = xlab, y = "Mean relative abundance", title = title) +
+    guides(fill = guide_legend(ncol = legend_cols)) + bar_theme
+  if (!is.null(facet))
+    p <- p + facet_grid(reformulate(facet), scales = "free_x", space = "free_x")
+  p
+}
+
+# (3): every sample its own bar
+plot_samples <- function(df, cols, rows = NULL, order_by = NULL, title) {
+  if (!is.null(order_by))
+    df$Sample <- factor(df$Sample, levels = unique(df$Sample[order(df[[order_by]], df$Sample)]))
+  df <- df %>% mutate(Class = order_classes(Class))
+  f  <- as.formula(paste(if (is.null(rows)) "." else rows, "~", paste(cols, collapse = " + ")))
+  ggplot(df, aes(Sample, Abundance, fill = Class)) +
+    geom_col(width = 0.9) +
+    facet_grid(f, scales = "free_x", space = "free_x",
+               labeller = labeller(.default = function(z) gsub("_", "\n", z))) +
+    scale_fill_manual(values = class_cols) +
+    scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
+    labs(x = NULL, y = "Relative abundance", title = title) +
+    bar_theme + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 7))
+}
+
+# ---- 3 plots per experiment ----
+bar_plots <- list(
+  IE = list(
+    rare    = plot_mean(bar_data$IE$rare, "Sample.Type", facet = "Site", xlab = NULL,
+                        title = "Internal/External – Class (rare <1% grouped)"),
+    all     = plot_mean(bar_data$IE$all,  "Sample.Type", facet = "Site", xlab = NULL,
+                        title = "Internal/External – Class (all taxa)", legend_cols = 3),
+    samples = plot_samples(bar_data$IE$rare, cols = c("Site", "Sample.Type"), order_by = "MatID",
+                           title = "Internal/External – Class, all samples (rare <1% grouped)")),
+  DI = list(
+    rare    = plot_mean(bar_data$DI$rare, "Diel_Time", xlab = "Diel time point",
+                        title = "Diel – Class (rare <1% grouped)"),
+    all     = plot_mean(bar_data$DI$all,  "Diel_Time", xlab = "Diel time point",
+                        title = "Diel – Class (all taxa)", legend_cols = 3),
+    samples = plot_samples(bar_data$DI$rare, cols = "Diel_Time",
+                           title = "Diel – Class, all samples (rare <1% grouped)")),
+  SM = list(
+    rare    = plot_mean(bar_data$SM$rare, "Month", facet = "Site", xlab = NULL,
+                        title = "Seasonal – Class (rare <1% grouped)") +
+                theme(axis.text.x = element_text(angle = 45, hjust = 1)),
+    all     = plot_mean(bar_data$SM$all,  "Month", facet = "Site", xlab = NULL,
+                        title = "Seasonal – Class (all taxa)", legend_cols = 3) +
+                theme(axis.text.x = element_text(angle = 45, hjust = 1)),
+    samples = plot_samples(bar_data$SM$rare, cols = "Month", rows = "Site",
+                           title = "Seasonal – Class, all samples (rare <1% grouped)")))
+
+walk(bar_plots, ~ walk(.x, print))
+```
+```{r}
+# Internal/External
+ggsave("ie_class_rare.pdf",    bar_plots$IE$rare,    width = 7,  height = 5)
+ggsave("ie_class_all.pdf",     bar_plots$IE$all,     width = 14, height = 7)
+ggsave("ie_class_samples.pdf", bar_plots$IE$samples, width = 11, height = 5)
+
+# Diel
+ggsave("diel_class_rare.pdf",    bar_plots$DI$rare,    width = 8,  height = 5)
+ggsave("diel_class_all.pdf",     bar_plots$DI$all,     width = 14, height = 7)
+ggsave("diel_class_samples.pdf", bar_plots$DI$samples, width = 13, height = 5)
+
+# Seasonal
+ggsave("seasonal_class_rare.pdf",    bar_plots$SM$rare,    width = 10, height = 7)
+ggsave("seasonal_class_all.pdf",     bar_plots$SM$all,     width = 16, height = 8)
+ggsave("seasonal_class_samples.pdf", bar_plots$SM$samples, width = 18, height = 7)
+```
+
+
