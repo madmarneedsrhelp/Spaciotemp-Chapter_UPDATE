@@ -116,7 +116,7 @@ View(samdf.ie)
  
 
  
- Internal External
+         Internal External
   SB        6        6
   TM        6        6
 
@@ -467,4 +467,623 @@ ggsave("seasonal_class_all.pdf",     bar_plots$SM$all,     width = 16, height = 
 ggsave("seasonal_class_samples.pdf", bar_plots$SM$samples, width = 18, height = 7)
 ```
 
+~
+RAREFACTION CURVE(S) ~ one for each experiment
+~
+
+```{r}
+summary(sample_sums(ie.ps.cleaner))
+summary(sample_sums(di.ps.cleaner))
+summary(sample_sums(sm.ps.cleaner))
+```
+ Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  39249   98641  118370  115041  128214  177990 
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  64854  110916  122474  132280  148142  230257 
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  13402   34522   48157   63381   78898  197095 
+  
+  
+```{r}
+# ---- rarefaction curve set up ----
+library(phyloseq)
+library(vegan)
+
+# helper: counts as samples x ASVs matrix + matching metadata
+get_otu <- function(ps) {
+  m <- as(otu_table(ps), "matrix")
+  if (taxa_are_rows(ps)) m <- t(m)
+  md <- data.frame(sample_data(ps))[rownames(m), ]
+  stopifnot(identical(rownames(md), rownames(m)))
+  list(otu = m, meta = md)
+}
+
+# one function, used for every experiment
+draw_rarecurve <- function(otu, cols, ltys = 1, title,
+                           legend_cols, legend_title,
+                           legend_ltys = NULL, legend_lty_title = NULL) {
+  vegan::rarecurve(otu, step = 1000, col = cols, lty = ltys, lwd = 1.5,
+                   label = FALSE,
+                   xlab = "Sequencing depth (reads)",
+                   ylab = "Observed ASV richness",
+                   main = title)
+  abline(v = min(rowSums(otu)), col = "grey40", lty = 2)   # lowest sample depth
+  legend("bottomright", legend = names(legend_cols), col = legend_cols,
+         lty = 1, lwd = 2, cex = 0.8, bty = "n", title = legend_title)
+  if (!is.null(legend_ltys))
+    legend("right", legend = names(legend_ltys), lty = legend_ltys,
+           lwd = 2, cex = 0.8, bty = "n", title = legend_lty_title)
+}
+
+# ---- Internal/External: colour = Sample.Type, line type = Site ----
+ie <- get_otu(ie.ps)
+type_colors <- c("Internal" = "darkorange2", "External" = "steelblue3")
+site_ltys   <- c("SB" = 1, "TM" = 3)
+ie_cols <- unname(type_colors[as.character(ie$meta$Sample.Type)])
+ie_ltys <- unname(site_ltys[as.character(ie$meta$Site)])
+
+# ---- Diel: colour = time point ----
+di <- get_otu(di.ps)
+diel_colors <- setNames(hcl.colors(7, "Dark 3"), 0:6)
+di_cols <- unname(diel_colors[as.character(di$meta$Diel_Time)])
+
+# ---- Seasonal: colour = Month, line type = Site ----
+sm <- get_otu(sm.ps)
+month_colors <- setNames(hcl.colors(9, "Dark 3"), levels(sm$meta$Month))
+sm_cols <- unname(month_colors[as.character(sm$meta$Month)])
+sm_ltys <- unname(site_ltys[as.character(sm$meta$Site)])
+
+# lowest depth per experiment (where the dashed line goes)
+sapply(list(IE = ie$otu, Diel = di$otu, Seasonal = sm$otu), function(x) min(rowSums(x)))
+```
+  IE     Diel    Seasonal 
+39249    64854    13402 
+```{r}
+# ---- Internal/External ----
+ie_plot <- function() draw_rarecurve(ie$otu, ie_cols, ie_ltys,
+  title = "Internal/External rarefaction curves",
+  legend_cols = type_colors, legend_title = "Sample type",
+  legend_ltys = site_ltys, legend_lty_title = "Site")
+ie_plot()
+pdf("ie_rarefaction_curves.pdf", width = 8, height = 6); ie_plot(); dev.off()
+
+# ---- Diel ----
+di_plot <- function() draw_rarecurve(di$otu, di_cols,
+  title = "Diel rarefaction curves",
+  legend_cols = diel_colors, legend_title = "Diel time point")
+di_plot()
+pdf("diel_rarefaction_curves.pdf", width = 8, height = 6); di_plot(); dev.off()
+
+
+# ---- Seasonal ----
+sm_plot <- function() draw_rarecurve(sm$otu, sm_cols, sm_ltys,
+  title = "Seasonal rarefaction curves",
+  legend_cols = setNames(month_colors, gsub("_", " ", names(month_colors))),
+  legend_title = "Month",
+  legend_ltys = site_ltys, legend_lty_title = "Site")
+sm_plot()
+pdf("seasonal_rarefaction_curves.pdf", width = 9, height = 6); sm_plot(); dev.off()
+```
+IE    
+39249 
+~ mostly all platueaing at this point, so looks fine
+
+Diel
+64854 
+~ mostly all platueaing at this point, so looks fine
+
+Seasonal
+13402 
+~certainly not plateauing (most samples) will have to try at different points
+
+looking deeper into seasonal
+```{r}
+depths <- sort(rowSums(sm$otu))
+head(depths, 12)                                 # lowest 12 samples
+
+cands <- c(15000, 20000, 25000, 30000, 40000)
+lost <- sapply(cands, function(d) {
+  gone <- names(depths)[depths < d]
+  c(n_lost = length(gone),
+    months = paste(unique(as.character(sm$meta[gone, "Month"])), collapse = ", "),
+    sites  = paste(unique(as.character(sm$meta[gone, "Site"])),  collapse = ", "))
+})
+colnames(lost) <- cands
+t(lost)
+
+# how flat are the curves at each depth? (new ASVs per extra read; closer to 0 = more plateaued)
+sapply(cands, function(d) {
+  ok <- rowSums(sm$otu) >= d
+  round(median(rareslope(sm$otu[ok, ], sample = d)), 4)
+})
+```
+  if cut at 20,000
+             
+                 SB TM
+  June_2023      0  5
+  July_2023      0  4
+  October_2023   5  4
+  December_2023  4  4
+  February_2024  5  4
+  April_2024     5  5
+  June_2024      5  5
+  August_2024    5  5
+  July_2025      0  6
+  
+  
+  
+if i cut at 25,000
+```{r}
+keep25 <- rowSums(sm$otu) >= 25000
+table(sm$meta$Month[keep25], sm$meta$Site[keep25])   # look for any TM month at 3
+```
+                SB TM
+  June_2023      0  5
+  July_2023      0  3
+  October_2023   5  4
+  December_2023  4  4
+  February_2024  5  3
+  April_2024     5  5
+  June_2024      5  4
+  August_2024    5  5
+  July_2025      0  6
+  
+  ~ RAREFICATION CURVE SEASONAL UPDATE
+```{r}
+draw_rarecurve <- function(otu, cols, ltys = 1, title,
+                           legend_cols, legend_title,
+                           legend_ltys = NULL, legend_lty_title = NULL,
+                           depth = NULL, lty_legend_pos = "right") {
+  vegan::rarecurve(otu, step = 1000, col = cols, lty = ltys, lwd = 1.5,
+                   label = FALSE,
+                   xlab = "Sequencing depth (reads)",
+                   ylab = "Observed ASV richness",
+                   main = title)
+  if (is.null(depth)) depth <- min(rowSums(otu))      # default: lowest sample
+  abline(v = depth, col = "grey40", lty = 2)
+  legend("bottomright", legend = names(legend_cols), col = legend_cols,
+         lty = 1, lwd = 2, cex = 0.8, bty = "n", title = legend_title)
+  if (!is.null(legend_ltys))
+    legend(lty_legend_pos, legend = names(legend_ltys), lty = legend_ltys,
+           lwd = 2, cex = 0.8, bty = "n", title = legend_lty_title)
+}
+
+# ---- Seasonal ----
+sm_plot <- function() draw_rarecurve(sm$otu, sm_cols, sm_ltys,
+  title = "Seasonal rarefaction curves",
+  legend_cols = setNames(month_colors, gsub("_", " ", names(month_colors))),
+  legend_title = "Month",
+  legend_ltys = site_ltys, legend_lty_title = "Site",
+  depth = 25000, lty_legend_pos = "bottom")
+sm_plot()
+pdf("seasonal_rarefaction_curves.pdf", width = 9, height = 6); sm_plot(); dev.off()
+```
+OKAY ~ determined rarefication depth for each
+
+IE    
+39249 
+~ mostly all platueaing at this point, so looks fine
+
+Diel
+64854 
+~ mostly all platueaing at this point, so looks fine
+
+Seasonal
+25000
+~ mostly all platueaing at this point (except summer samples in august/july), so looks fine?
+
+~
+INTERNAL EXTERNAL ALPHA DIVERSITY
+~
+
+         Internal External
+  SB        6        6
+  TM        6        6
+  
+  
+```{r}
+library(phyloseq); library(tidyverse); library(vegan)
+library(lme4); library(lmerTest)        # lmerTest adds p-values to lmer
+
+# ---- helper: four alpha metrics ----
+alpha_df <- function(ps) {
+  a <- estimate_richness(ps, measures = c("Observed", "Shannon", "InvSimpson"))
+  a$Evenness <- a$Shannon / log(a$Observed)          # Pielou's evenness
+  a$Sample <- sample_names(ps)
+  a
+}
+
+ie_depth <- min(sample_sums(ie.ps)); ie_depth        # 39,249
+
+# ---- 1. unrarefied ----
+ie_alpha_unrare <- alpha_df(ie.ps)
+
+# ---- 2. single-draw rarefied ----
+ie.rare <- rarefy_even_depth(ie.ps, sample.size = ie_depth, rngseed = 100,
+                             replace = FALSE, verbose = FALSE)
+ie_alpha_rare1 <- alpha_df(ie.rare)
+
+# ---- 3. 100-draw averaged rarefied ----
+ie_alpha_rare100 <- map_dfr(1:100, function(i) {
+  alpha_df(rarefy_even_depth(ie.ps, sample.size = ie_depth, rngseed = i,
+                             replace = FALSE, verbose = FALSE))
+}) |>
+  group_by(Sample) |>
+  summarise(across(c(Observed, Shannon, InvSimpson, Evenness), mean), .groups = "drop")
+
+# ---- add metadata + depth ----
+ie_meta <- data.frame(sample_data(ie.ps)) |>
+  mutate(Sample = rownames(data.frame(sample_data(ie.ps))),
+         Depth  = sample_sums(ie.ps)) |>
+  select(Sample, Site, Sample.Type, MatID, Depth)
+
+ie_alpha <- list(unrarefied   = ie_alpha_unrare,
+                 rarefied_1   = ie_alpha_rare1,
+                 rarefied_100 = ie_alpha_rare100) |>
+  map(~ left_join(.x, ie_meta, by = "Sample"))
+
+# ---- does depth differ by Sample.Type or Site? ----
+anova(lmer(log(Depth) ~ Sample.Type * Site + (1 | MatID), data = ie_alpha$unrarefied))
+
+# ---- mixed models for every metric x data set ----
+metrics <- c("Observed", "Shannon", "InvSimpson", "Evenness")
+
+run_alpha_ie <- function(df) {
+  map_dfr(metrics, function(m) {
+    mod <- lmer(as.formula(paste(m, "~ Sample.Type * Site + (1 | MatID)")), data = df)
+    a   <- as.data.frame(anova(mod))
+    data.frame(metric = m, term = rownames(a),
+               F = round(a$`F value`, 2), df_den = round(a$DenDF, 1),
+               p = round(a$`Pr(>F)`, 4),
+               shapiro_p = round(shapiro.test(resid(mod))$p.value, 3),
+               singular  = isSingular(mod))
+  })
+}
+
+ie_alpha_results <- map_dfr(ie_alpha, run_alpha_ie, .id = "dataset")
+ie_alpha_results
+```
+```{r}
+ie_alpha_unrare  <- ie_alpha$unrarefied
+ie_alpha_rare1   <- ie_alpha$rarefied_1
+ie_alpha_rare100 <- ie_alpha$rarefied_100
+ie_alpha_unrare  <- ie_alpha$unrarefied   |> rename(OrigDepth = Depth)
+ie_alpha_rare1   <- ie_alpha$rarefied_1   |> rename(OrigDepth = Depth) |> mutate(RareDepth = ie_depth)
+ie_alpha_rare100 <- ie_alpha$rarefied_100 |> rename(OrigDepth = Depth) |> mutate(RareDepth = ie_depth)
+```
+
+```{r}
+View(ie_alpha_unrare)
+View(ie_alpha_rare1)
+View(ie_alpha_rare100)
+```
+
+~ INTERNAL/EXTERNAL ALPHA MODELS
+
+*2 predictor variables (site & internal/external - but have to account for the fact that internal and external mats are from the same mat ID)
+* switch from anova to a linear mixed model ~ an ANOVA-type model with one extra piece:
+- Fixed effects are what you're testing: Site, Sample.Type and their interaction (same as in ANOVA)
+- A random effect, (1 | MatID), lets each mat have its own baseline (because mats are not independent). 
+  - One mat might be richer overall than another, and the model accounts for that.
+
+```{r}
+library(lme4); library(lmerTest); library(car)
+
+# UNRAREFIED 
+lmm.ie.unrare <- lmer(Observed ~ Site * Sample.Type + (1 | MatID), data = ie_alpha_unrare)
+anova(lmm.ie.unrare)          # F tests with Satterthwaite df (Site ~1,10; Sample.Type ~1,10)
+
+# Assumption checks
+qqnorm(resid(lmm.ie.unrare)); qqline(resid(lmm.ie.unrare), col = "red")
+shapiro.test(resid(lmm.ie.unrare))
+leveneTest(Observed ~ interaction(Site, Sample.Type), data = ie_alpha_unrare)
+plot(fitted(lmm.ie.unrare), resid(lmm.ie.unrare), xlab = "Fitted", ylab = "Residuals")
+abline(h = 0, lty = 2)
+
+# Effect sizes
+effectsize::eta_squared(lmm.ie.unrare, partial = TRUE)
+```
+Follow up sig observed interaction for unrare
+```{r}
+library(emmeans)
+
+emm <- emmeans(lmm.ie.unrare, ~ Sample.Type * Site)
+emm                                              # model-estimated means for all 4 groups
+
+# Internal vs External at each site (the paired comparison)
+pairs(emmeans(lmm.ie.unrare, ~ Sample.Type | Site))
+
+# SB vs TM for each sample type
+pairs(emmeans(lmm.ie.unrare, ~ Site | Sample.Type))
+
+# Interaction plot: lines that cross = the interaction
+emmip(lmm.ie.unrare, Sample.Type ~ Site, CIs = TRUE) +
+  labs(y = "Observed ASV richness (estimated mean)") + theme_classic()
+```
+
+shannon transformed to account for normality assumption
+```{r}
+lmm.ie.expshan <- lmer(exp(Shannon) ~ Site * Sample.Type + (1 | MatID), data = ie_alpha_unrare)
+anova(lmm.ie.expshan)
+shapiro.test(resid(lmm.ie.expshan))
+```
+where is evenness higher?
+```{r}
+library(emmeans)
+
+lmm.ie.even <- lmer(Evenness ~ Site * Sample.Type + (1 | MatID), data = ie_alpha_unrare)
+
+emmeans(lmm.ie.even, ~ Sample.Type)            # estimated mean evenness: Internal vs External
+pairs(emmeans(lmm.ie.even, ~ Sample.Type))     # Internal - External difference + p-value
+
+# raw means as a quick sanity check
+ie_alpha_unrare |>
+  group_by(Sample.Type) |>
+  summarise(mean_evenness = mean(Evenness), sd = sd(Evenness), n = n())
+```
+
+
+
+Unrare Results: 
+Observed
+- significant interaction (p = 0.037, partial η² = 0.37) 
+- this means the internal vs external difference isn't the same at both sites
+- so the main effects can't be read on their own
+- Assumptions pass
+- Follow up results:
+  - no sig differences between internal// external areas at each site 
+  - no sig differences between internal or external area (across sites)
+  - interesting cross pattern seen....
+
+Evenness
+- Sample.Type is significant (p = 0.016, partial η² = 0.46, a large effect): evenness differs between internal and external.
+- No interaction, so the difference is consistent at both sites. 
+- No Site effect
+- Assumptions pass
+
+Inv Simpson
+- No sig differences
+- Assumptions pass
+
+Shannon 
+- Assumptions dont pass!
+- Shannon diversity was converted to the effective number of species (exp(H'), Hill number q = 1) to meet model assumptions
+  - no sig results
+
+```{r}
+library(lme4); library(lmerTest); library(car)
+
+# RARE ONCE 
+lmm.ie.rare1 <- lmer(Shannon ~ Site * Sample.Type + (1 | MatID), data = ie_alpha_rare1)
+anova(lmm.ie.rare1)          # F tests with Satterthwaite df (Site ~1,10; Sample.Type ~1,10)
+
+# Assumption checks
+qqnorm(resid(lmm.ie.rare1)); qqline(resid(lmm.ie.rare1), col = "red")
+shapiro.test(resid(lmm.ie.rare1))
+leveneTest(Shannon ~ interaction(Site, Sample.Type), data = ie_alpha_rare1)
+plot(fitted(lmm.ie.rare1), resid(lmm.ie.rare1), xlab = "Fitted", ylab = "Residuals")
+abline(h = 0, lty = 2)
+
+# Effect sizes
+effectsize::eta_squared(lmm.ie.rare1, partial = TRUE)
+```
+Follow up sig observed interaction for unrare
+```{r}
+library(emmeans)
+
+emm <- emmeans(lmm.ie.rare1, ~ Sample.Type * Site)
+emm                                              # model-estimated means for all 4 groups
+
+# Internal vs External at each site (the paired comparison)
+pairs(emmeans(lmm.ie.rare1, ~ Sample.Type | Site))
+
+# SB vs TM for each sample type
+pairs(emmeans(lmm.ie.rare1, ~ Site | Sample.Type))
+
+# Interaction plot: lines that cross = the interaction
+emmip(lmm.ie.rare1, Sample.Type ~ Site, CIs = TRUE) +
+  labs(y = "Observed ASV richness (estimated mean)") + theme_classic()
+```
+shannon transformed to account for normality assumption
+```{r}
+lmm.ie.expshan2 <- lmer(exp(Shannon) ~ Site * Sample.Type + (1 | MatID), data = ie_alpha_rare1)
+anova(lmm.ie.expshan2)
+shapiro.test(resid(lmm.ie.expshan2))
+```
+
+Rare1 Results: 
+
+Observed
+- significant interaction (p = 0.036, partial η² = 0.37) 
+- this means the internal vs external difference isn't the same at both sites
+- so the main effects can't be read on their own
+- Assumptions pass
+Follow up results:
+  - no sig differences between internal// external areas at each site 
+  - no sig differences between internal or external area (across sites)
+  - interesting cross pattern seen....
+
+Evenness
+- Sample.Type is significant (p = 0.02, partial η² = 0.44, a large effect): evenness differs between internal and external.
+- No interaction, so the difference is consistent at both sites. 
+- No Site effect
+- Assumptions pass
+
+Inv Simpson
+- No sig differences
+- Assumptions pass
+
+Shannon 
+- Assumptions dont pass!
+- Shannon diversity was converted to the effective number of species (exp(H'), Hill number q = 1) to meet model assumptions
+  - no sig results
+  
+  
+```{r}
+library(lme4); library(lmerTest); library(car)
+
+# RARE 100 SUBSAMPLES 
+lmm.ie.rare100 <- lmer(Shannon ~ Site * Sample.Type + (1 | MatID), data = ie_alpha_rare100)
+anova(lmm.ie.rare100)          # F tests with Satterthwaite df (Site ~1,10; Sample.Type ~1,10)
+
+# Assumption checks
+qqnorm(resid(lmm.ie.rare100)); qqline(resid(lmm.ie.rare100), col = "red")
+shapiro.test(resid(lmm.ie.rare100))
+leveneTest(Shannon ~ interaction(Site, Sample.Type), data = ie_alpha_rare100)
+plot(fitted(lmm.ie.rare100), resid(lmm.ie.rare100), xlab = "Fitted", ylab = "Residuals")
+abline(h = 0, lty = 2)
+
+# Effect sizes
+effectsize::eta_squared(lmm.ie.rare100, partial = TRUE)
+```
+
+Follow up sig observed interaction for unrare
+```{r}
+library(emmeans)
+
+emm <- emmeans(lmm.ie.rare100, ~ Sample.Type * Site)
+emm                                              # model-estimated means for all 4 groups
+
+# Internal vs External at each site (the paired comparison)
+pairs(emmeans(lmm.ie.rare100, ~ Sample.Type | Site))
+
+# SB vs TM for each sample type
+pairs(emmeans(lmm.ie.rare100, ~ Site | Sample.Type))
+
+# Interaction plot: lines that cross = the interaction
+emmip(lmm.ie.rare100, Sample.Type ~ Site, CIs = TRUE) +
+  labs(y = "Observed ASV richness (estimated mean)") + theme_classic()
+```
+shannon transformed to account for normality assumption
+```{r}
+lmm.ie.expshan3 <- lmer(exp(Shannon) ~ Site * Sample.Type + (1 | MatID), data = ie_alpha_rare100)
+anova(lmm.ie.expshan3)
+shapiro.test(resid(lmm.ie.expshan3))
+```
+
+Rare100 Results: 
+
+Observed
+- significant interaction (p = 0.04, partial η² = 0.36) 
+- this means the internal vs external difference isn't the same at both sites
+- so the main effects can't be read on their own
+- Assumptions pass
+Follow up results:
+  - no sig differences between internal// external areas at each site 
+  - no sig differences between internal or external area (across sites)
+  - interesting cross pattern seen....
+
+Evenness
+- Sample.Type is significant (p = 0.018, partial η² = 0.44, a large effect): evenness differs between internal and external.
+- No interaction, so the difference is consistent at both sites. 
+- No Site effect
+- Assumptions pass
+
+Inv Simpson
+- No sig differences
+- Assumptions pass
+
+Shannon 
+- Assumptions dont pass!
+- Shannon diversity was converted to the effective number of species (exp(H'), Hill number q = 1) to meet model assumptions
+  - no sig results
+
+~~~~
+I/E ALPHA DIVERSITY CONCLUSIONS (consistent across unrarefied, single-draw rarefied and 100-draw rarefied data)
+
+Observed richness: 
+- significant Site × Sample Type interaction (p ≈ 0.04, partial η² ≈ 0.37). 
+- The direction of the internal vs external difference reversed between sites: internal locations tended to be richer at SB, and external locations at TM. 
+- Neither within-site difference was significant, and SB and TM did not differ for internal or for external samples.
+
+Evenness: 
+- differed significantly between internal and external locations (p ≈ 0.02, partial η² ≈ 0.45), consistently at both sites (no interaction). 
+- Evenness was higher in internal mat areas. 
+
+~~~~
+I/E ALPHA DIVERSITY PLOT
+
+```{r}
+library(tidyverse); library(cowplot); library(lme4); library(lmerTest); library(emmeans)
+
+site_cols <- c("SB" = "#1b9e77", "TM" = "#7570b3")
+type_cols <- c("Internal" = "pink3", "External" = "steelblue3")
+
+# ---- stats for the labels ----
+lmm.ie.even <- lmer(Evenness ~ Site * Sample.Type + (1 | MatID), data = ie_alpha_unrare)
+lmm.ie.obs  <- lmer(Observed ~ Site * Sample.Type + (1 | MatID), data = ie_alpha_unrare)
+
+p_type <- anova(lmm.ie.even)["Sample.Type", "Pr(>F)"]               # main effect, evenness
+p_int  <- anova(lmm.ie.obs)["Site:Sample.Type", "Pr(>F)"]           # interaction, observed
+
+stars <- function(p) ifelse(p < 0.001, "***", ifelse(p < 0.01, "**",
+                     ifelse(p < 0.05, "*", paste0("p = ", sprintf("%.2f", p)))))
+
+# within-site Internal vs External contrasts (for the brackets)
+even_ct <- as.data.frame(pairs(emmeans(lmm.ie.even, ~ Sample.Type | Site)))
+even_ct$x     <- as.numeric(factor(even_ct$Site, levels = levels(ie_alpha_unrare$Site)))
+even_ct$label <- stars(even_ct$p.value)
+even_ct                                                          # check these before plotting
+
+y_br  <- max(ie_alpha_unrare$Evenness) + 0.006                   # bracket height
+y_top <- y_br + 0.015
+
+# ---- A: Evenness boxplot with site shading + brackets ----
+p_even_box <- ggplot(ie_alpha_unrare, aes(Site, Evenness, fill = Sample.Type)) +
+  geom_blank() +                                                 # sets up the discrete x axis
+  annotate("rect", xmin = 0.5, xmax = 1.5, ymin = -Inf, ymax = Inf,
+           fill = site_cols["SB"], alpha = 0.15) +
+  annotate("rect", xmin = 1.5, xmax = 2.5, ymin = -Inf, ymax = Inf,
+           fill = site_cols["TM"], alpha = 0.15) +
+  geom_boxplot(position = position_dodge(width = 0.8), width = 0.6,
+               outlier.shape = NA, alpha = 0.9) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.8),
+             size = 2, alpha = 0.8, shape = 21, colour = "black") +
+  # brackets: Internal (x - 0.2) to External (x + 0.2) at each site
+  geom_segment(data = even_ct, aes(x = x - 0.2, xend = x + 0.2, y = y_br, yend = y_br),
+               inherit.aes = FALSE) +
+  geom_segment(data = even_ct, aes(x = x - 0.2, xend = x - 0.2, y = y_br, yend = y_br - 0.003),
+               inherit.aes = FALSE) +
+  geom_segment(data = even_ct, aes(x = x + 0.2, xend = x + 0.2, y = y_br, yend = y_br - 0.003),
+               inherit.aes = FALSE) +
+  geom_text(data = even_ct, aes(x = x, y = y_br + 0.004, label = label),
+            inherit.aes = FALSE, size = 4) +
+  scale_fill_manual(values = type_cols) +
+  scale_y_continuous(limits = c(0.8, y_top), breaks = seq(0.8, 1, 0.05),
+                     expand = expansion(mult = c(0, 0.02))) +
+  labs(x = "Site", y = "Pielou's Evenness", fill = NULL, title = "A",
+       subtitle = paste0("Sample type: p = ", sprintf("%.3f", p_type))) +
+  theme_classic(base_size = 12)
+
+# ---- B: Observed crossover with interaction label ----
+obs_sum <- ie_alpha_unrare |>
+  group_by(Site, Sample.Type) |>
+  summarise(mean = mean(Observed), se = sd(Observed) / sqrt(n()), .groups = "drop")
+dodge <- position_dodge(width = 0.15)
+
+p_obs <- ggplot() +
+  geom_line(data = ie_alpha_unrare, aes(Sample.Type, Observed, group = MatID, colour = Site),
+            alpha = 0.25, linewidth = 0.4) +
+  geom_point(data = ie_alpha_unrare, aes(Sample.Type, Observed, colour = Site),
+             alpha = 0.35, size = 1.5) +
+  geom_line(data = obs_sum, aes(Sample.Type, mean, group = Site, colour = Site),
+            linewidth = 1.2, position = dodge) +
+  geom_errorbar(data = obs_sum, aes(Sample.Type, ymin = mean - se, ymax = mean + se, colour = Site),
+                width = 0.08, linewidth = 0.8, position = dodge) +
+  geom_point(data = obs_sum, aes(Sample.Type, mean, colour = Site), size = 3.5, position = dodge) +
+  scale_colour_manual(values = site_cols) +
+  scale_y_continuous(limits = c(1000, 3500), breaks = seq(1000, 3500, 500),
+                     expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "Observed ASV Richness", colour = "Site", title = "B",
+       subtitle = paste0("Site × Sample type: p = ", sprintf("%.3f", p_int))) +
+  theme_classic(base_size = 12)
+
+# ---- combine ----
+ie_alpha_fig <- plot_grid(p_even_box, p_obs, ncol = 2, align = "h", axis = "tb")
+ie_alpha_fig
+
+ggsave("ie_alpha_diversity_fig.pdf", ie_alpha_fig, width = 10, height = 6)
+```
+
+~ DIEL ALPHA MODELS
 
